@@ -415,9 +415,12 @@ class VisionTransformer(nn.Module):
         super().__init__()
         assert global_pool in ('', 'avg', 'token')
         assert class_token or global_pool != 'token'
+        self.prompt_length = prompt_length
         use_fc_norm = global_pool == 'avg' if fc_norm is None else fc_norm
         norm_layer = norm_layer or partial(nn.LayerNorm, eps=1e-6)
         act_layer = act_layer or nn.GELU
+
+        self.prompt_order_list = []
 
         self.img_size = img_size
         self.num_classes = num_classes
@@ -427,7 +430,6 @@ class VisionTransformer(nn.Module):
         self.num_prefix_tokens = 1 if class_token else 0
         self.no_embed_class = no_embed_class
         self.grad_checkpointing = False
-        self.child_prompt_pool = []
 
         self.patch_embed = embed_layer(
             img_size=img_size, patch_size=patch_size, in_chans=in_chans, embed_dim=embed_dim)
@@ -493,6 +495,13 @@ class VisionTransformer(nn.Module):
                                     prompt_key_init=prompt_key_init, num_layers=num_e_prompt,
                                     use_prefix_tune_for_e_prompt=use_prefix_tune_for_e_prompt,
                                     num_heads=num_heads, same_key_value=same_key_value)
+            _num_layers, _dual, _pool_size, _length, _num_heads, _embed_dim_divby_num_heads = self.e_prompt.prompt.shape
+            #for i in range(_pool_size):
+            #    embd_tsr = torch.load("./embed/clip_Split-CIFAR100/"+str(i)+".pt").to("cuda" if torch.cuda.is_available() else "cpu")
+            #    embd_tsr = embd_tsr.squeeze(0)
+            #    embd_tsr = torch.cat(embd_tsr, torch.zeros(embed_dim -embd_tsr.shape[0],), dim = 0)
+            #    embd_tsr = embd_tsr.reshape(_num_heads, _embed_dim_divby_num_heads)
+            #    self.e_prompt.prompt[:, :, i, :, :, :] = embd_tsr.expand(_num_layers, _dual, 1, _length, _num_heads, _embed_dim_divby_num_heads)
 
         if not (use_g_prompt or use_e_prompt):
             attn_layer = Attention
@@ -574,71 +583,29 @@ class VisionTransformer(nn.Module):
             self.global_pool = global_pool
         self.head = nn.Linear(self.embed_dim, num_classes) if num_classes > 0 else nn.Identity()
 
-    def init_prompt(self, data_loader, task_id=-1, prompt_id = None, train = False, num_classes=10, device = "cpu"):
-        if not (self.use_g_prompt or self.use_e_prompt):
+    def generate_prompt_indices(self, train = False, batch_num = -1):
+        print('TM', train, batch_num)
+        if self.prompt_length is None:
             return None
-        if len(self.child_prompt_pool) is not 0:
-            a = [i for i in range(len(self.child_prompt_pool))]
-            a = a[:-1]
-            random.shuffle(a)
-            cnt = 0
-            for i in range(0, len(a), len(a)//num_classes):
-                if cnt == 10:
-                    break
-                #self.e_prompt.prompt[:, :, task_id, cnt] = torch.mean(self.child_prompt_pool[a[i:i+len(a)//num_classes]], 0)
-                #self.e_prompt.prompt[:, :, task_id, cnt] = torch.mean(torch.stack([self.child_prompt_pool[j] for j in a[i:i+len(a)//num_classes]]), 0)
-                with torch.no_grad():
-                    self.e_prompt.prompt[:, :, task_id, cnt] = torch.mean(torch.cat([self.child_prompt_pool[j] for j in a[i:i+len(a)//num_classes]], 1), 1).squeeze(2)
-                    #self.e_prompt.prompt[:, :, task_id, cnt] = torch.mean(torch.mean(torch.stack([self.child_prompt_pool[j] for j in a[i:i+len(a)//num_classes]]), 0), 1).squeeze(2)
-                cnt += 1
-            self.child_prompt_pool = []
-        elif task_id != -1 and train:
-            embed_sum = {}
-            embed_cnt = {}
-            for i in range(num_classes):
-                embed_cnt[i] = 0
-                embed_sum[i] = []
-            for input, target in data_loader:
-                input = input.to(device, non_blocking=True)
-                #print(input.shape)
-                x = self.patch_embed(input)
-                #print(x.shape)
-                if self.cls_token is not None:
-                    x = torch.cat((self.cls_token.expand(x.shape[0], -1, -1), x), dim=1)
-                #print(x.shape)
-                x = self.pos_drop(x + self.pos_embed)
-                #print(x.shape)
-                x = self.blocks(x)
-                #print(x.shape)
-                x = self.norm(x)
-                #print(x.shape)
+        if len(self.prompt_order_list) == batch_num:
+            _ls = list(range(self.e_prompt.length))
+            random.shuffle(_ls)
+            print(_ls)
+            self.prompt_order_list.append(_ls)
+            #return self.prompt_order_list[batch_num][]
+        if self.use_e_prompt and self.e_prompt_layer_idx is not None and train:
+            return self.prompt_order_list[batch_num][:self.e_prompt.send_length]
+        if self.use_e_prompt and self.e_prompt_layer_idx is not None:
+            #return self.prompt_order_list[batch_num][:self.e_prompt.send_length]
+            return list(range(self.e_prompt.length))
+        return None
 
-                for i in range(x.shape[0]):
-                    #embed_sum[target[i].item()].append(torch.reshape(torch.mean(x[i], 0), self.e_prompt.prompt[:, :, task_id, 0].shape))
-                    #embed_sum[target[i].item()].append(torch.reshape(torch.mean(x[i], 0).unsqueeze(0).unsqueeze(0), self.e_prompt.prompt[:, :, task_id, 0])
-                    tensor = torch.mean(x[i], 0)
-                    shape = self.e_prompt.prompt[:, :, task_id, 0].shape
-                    tensor = tensor.reshape(1, 1, shape[2], shape[3])
-                    tensor = tensor.repeat(shape[0], shape[1], 1, 1)
-                    embed_sum[target[i].item()].append(tensor)
-                    #print(embed_sum[target[i].item()][0].shape)
-                    embed_cnt[target[i].item()] += 1
-            for i in range(num_classes):
-                #print(embed_sum[i][0].shape)
-                with torch.no_grad():
-                    self.e_prompt.prompt[:, :, task_id, i] = torch.mean(torch.stack(embed_sum[i]), 0)
-            a = []
-            for i in range(num_classes):
-                a.extend(embed_sum[i])
-            a = torch.mean(torch.stack(a), 0)
-            for i in range(num_classes):
-                with torch.no_grad():
-                    self.e_prompt.prompt[:, :, task_id, i] = self.e_prompt.prompt[:, :, task_id, i] * a
-                    self.e_prompt.prompt[:, :, task_id, i] = self.e_prompt.prompt[:, :, task_id, i].detach().clone()
-        self.e_prompt.prompt.to(device)
-
-
-    def forward_features(self, x, task_id=-1, prompt_id=None, prompt_weight=None, train=False, prompt_momentum=0):
+    def forward_features(self, x, task_id=-1, prompt_id=None, prompt_weight=None, train=False, prompt_momentum=0, batch_num = -1):
+        outp = self.generate_prompt_indices(train, batch_num)
+        prompt_list = None
+        if outp is not None:
+            prompt_list = sorted(outp)
+        
         x = self.patch_embed(x)
 
         if self.cls_token is not None:
@@ -664,26 +631,7 @@ class VisionTransformer(nn.Module):
                 g_prompt_counter = -1
                 e_prompt_counter = -1
 
-                y = self.blocks(x).detach().clone()
-                keys_y = []
-                for i in range(y.shape[0]):
-                    #a = torch.reshape(y[i], self.e_prompt.prompt[:, :, task_id, 0].shape)
-                    a = torch.mean(x[i], 0)
-                    shape = self.e_prompt.prompt[:, :, task_id, 0].shape
-                    a = a.reshape(1, 1, shape[2], shape[3])
-                    a = a.repeat(shape[0], shape[1], 1, 1)
-                    cosine_sim = []
-                    for j in range(self.e_prompt.prompt.shape[3]):
-                        #print(self.e_prompt.prompt[:, :, task_id, j].shape, a.shape)
-                        la = torch.sum(self.e_prompt.prompt[:, :, task_id, j] * a)
-                        #print(la.shape, la, float(la.item()))
-                        cosine_sim.append(float(la.item()))
-                        #cosine_sim.append(torch.sum(self.e_prompt.prompt[:, :, task_id, j] * a).item())
-                    keys_y.append(sorted(range(len(cosine_sim)), key=lambda i: cosine_sim[i], reverse=True)[:2])
-
-                res = self.e_prompt(x, keys_y, prompt_mask=prompt_mask, prompt_idx=prompt_id, prompt_weight=prompt_weight, prompt_momentum=prompt_momentum)
-                self.child_prompt_pool.append(res['batched_prompt'])
-                #self.child_prompt_pool.append(res)
+                res = self.e_prompt(x, prompt_list, prompt_mask=prompt_mask, prompt_idx=prompt_id, prompt_weight=prompt_weight, prompt_momentum=prompt_momentum)
                 e_prompt = res['batched_prompt']
 
                 for i, block in enumerate(self.blocks):
@@ -701,9 +649,6 @@ class VisionTransformer(nn.Module):
                         e_prompt_counter += 1
                         if self.use_prefix_tune_for_e_prompt:
                             # Prefix tunning, [B, 2, top_k * e_prompt_length, num_heads, embed_dim // num_heads]
-                            #print(x.get_device(), e_prompt.get_device())
-                            e_prompt=e_prompt.to('cuda')
-                            #print(x.get_device(), e_prompt.get_device())
                             x = block(x, prompt=e_prompt[e_prompt_counter])
                         else:
                             # Pommpt tunning, [B, top_k * e_prompt_length, embed_dim]
@@ -750,14 +695,14 @@ class VisionTransformer(nn.Module):
 
         return res
 
-    def forward(self, x, task_id=-1, prompt_id=None, prompt_weight=None, train=False, fc_only=False, prompt_momentum=0):
+    def forward(self, x, task_id=-1, prompt_id=None, prompt_weight=None, train=False, fc_only=False, prompt_momentum=0, batch_num=-1):
         if fc_only:
             res = dict()
             x = self.mlp(x)
             x = self.fc_norm(x)
             res['logits'] = self.head(x)
             return res
-        res = self.forward_features(x, task_id=task_id, prompt_id=prompt_id, prompt_weight=prompt_weight, train=train, prompt_momentum=prompt_momentum)
+        res = self.forward_features(x, task_id=task_id, prompt_id=prompt_id, prompt_weight=prompt_weight, train=train, prompt_momentum=prompt_momentum, batch_num=batch_num)
         res = self.forward_head(res)
         return res
 

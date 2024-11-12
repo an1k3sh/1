@@ -19,7 +19,6 @@ from timm.scheduler import create_scheduler
 from torch import optim
 import utils
 from torch.distributions.multivariate_normal import MultivariateNormal
-import vits.hide_prompt_vision_transformer as hide_prompt_vision_transformer
 
 
 def train_one_epoch(model: torch.nn.Module, original_model: torch.nn.Module,
@@ -37,11 +36,12 @@ def train_one_epoch(model: torch.nn.Module, original_model: torch.nn.Module,
     metric_logger.add_meter('Loss', utils.SmoothedValue(window_size=1, fmt='{value:.4f}'))
     header = f'Train: Epoch[{epoch + 1:{int(math.log10(args.epochs)) + 1}}/{args.epochs}]'
 
-    model.module.init_prompt(data_loader, task_id=task_id, train=set_training_mode, num_classes=10, device = device)
+    batch_num = 0
     for input, target in metric_logger.log_every(data_loader, args.print_freq, header):
         input = input.to(device, non_blocking=True)
         target = target.to(device, non_blocking=True)
 
+        
         with torch.no_grad():
             if original_model is not None:
                 output = original_model(input)
@@ -56,14 +56,13 @@ def train_one_epoch(model: torch.nn.Module, original_model: torch.nn.Module,
                     logits = logits.index_fill(dim=1, index=not_mask, value=float('-inf'))
                     prompt_id = torch.max(logits, dim=1)[1]
                     # translate cls to task_id
-                    prompt_id = torch.tensor([target_task_map[v.item()] for v in prompt_id], device=device).unsqueeze(
-                        -1)
+                    prompt_id = torch.tensor([target_task_map[v.item()] for v in prompt_id], device=device).unsqueeze(-1)
                 else:
                     prompt_id = None
             else:
                 raise NotImplementedError("original model is None")
-        output = model(input, task_id=task_id, prompt_id=prompt_id, train=set_training_mode,
-                       prompt_momentum=args.prompt_momentum)
+        output = model(input, task_id=task_id, prompt_id=prompt_id, train=set_training_mode, prompt_momentum=args.prompt_momentum, batch_num=batch_num)
+        
         logits = output['logits']
         # here is the trick to mask out classes of non-current tasks
         if args.train_mask and class_mask is not None:
@@ -91,6 +90,7 @@ def train_one_epoch(model: torch.nn.Module, original_model: torch.nn.Module,
         metric_logger.update(Lr=optimizer.param_groups[0]["lr"])
         metric_logger.meters['Acc@1'].update(acc1.item(), n=input.shape[0])
         metric_logger.meters['Acc@5'].update(acc5.item(), n=input.shape[0])
+        batch_num += 1
 
     # gather the stats from all processes
     metric_logger.synchronize_between_processes()
@@ -129,8 +129,7 @@ def evaluate(model: torch.nn.Module, original_model: torch.nn.Module, data_loade
                         logits = logits.index_fill(dim=1, index=not_mask, value=float('-inf'))
                     prompt_id = torch.max(logits, dim=1)[1]
                     # translate cls to task_id
-                    prompt_id = torch.tensor([target_task_map[v.item()] for v in prompt_id], device=device).unsqueeze(
-                        -1)
+                    prompt_id = torch.tensor([target_task_map[v.item()] for v in prompt_id], device=device).unsqueeze(-1)
                     # print(prompt_id)
                 else:
                     raise NotImplementedError("original model is None")
@@ -256,53 +255,53 @@ def train_and_evaluate(model: torch.nn.Module, model_without_ddp: torch.nn.Modul
         checkpoint_path = os.path.join(args.output_dir, 'checkpoint/task{}_checkpoint.pth'.format(task_id + 1))
         
         # Transfer previous learned prompt params to the new prompt
-        # if args.prompt_pool and args.shared_prompt_pool:
-        #     if task_id > 0:
-        #         prev_start = (task_id - 1) * args.top_k
-        #         prev_end = task_id * args.top_k
+        if args.prompt_pool and args.shared_prompt_pool:
+            if task_id > 0:
+                prev_start = (task_id - 1) * args.top_k
+                prev_end = task_id * args.top_k
 
-        #         cur_start = prev_end
-        #         cur_end = (task_id + 1) * args.top_k
+                cur_start = prev_end
+                cur_end = (task_id + 1) * args.top_k
 
-        #         if (prev_end > args.size) or (cur_end > args.size):
-        #             pass
-        #         else:
-        #             cur_idx = (
-        #                 slice(None), slice(None), slice(cur_start, cur_end)) if args.use_prefix_tune_for_e_prompt else (
-        #                 slice(None), slice(cur_start, cur_end))
-        #             prev_idx = (
-        #                 slice(None), slice(None),
-        #                 slice(prev_start, prev_end)) if args.use_prefix_tune_for_e_prompt else (
-        #                 slice(None), slice(prev_start, prev_end))
+                if (prev_end > args.size) or (cur_end > args.size):
+                    pass
+                else:
+                    cur_idx = (
+                        slice(None), slice(None), slice(cur_start, cur_end)) if args.use_prefix_tune_for_e_prompt else (
+                        slice(None), slice(cur_start, cur_end))
+                    prev_idx = (
+                        slice(None), slice(None),
+                        slice(prev_start, prev_end)) if args.use_prefix_tune_for_e_prompt else (
+                        slice(None), slice(prev_start, prev_end))
 
-        #             with torch.no_grad():
-        #                 if args.distributed:
-        #                     model.module.e_prompt.prompt.grad.zero_()
-        #                     model.module.e_prompt.prompt[cur_idx] = model.module.e_prompt.prompt[prev_idx]
-        #                     # optimizer.param_groups[0]['params'] = model.module.parameters()
-        #                 else:
-        #                     model.e_prompt.prompt.grad.zero_()
-        #                     model.e_prompt.prompt[cur_idx] = model.e_prompt.prompt[prev_idx]
-        #                     # optimizer.param_groups[0]['params'] = model.parameters()
+                    with torch.no_grad():
+                        if args.distributed:
+                            model.module.e_prompt.prompt.grad.zero_()
+                            model.module.e_prompt.prompt[cur_idx] = model.module.e_prompt.prompt[prev_idx]
+                            # optimizer.param_groups[0]['params'] = model.module.parameters()
+                        else:
+                            model.e_prompt.prompt.grad.zero_()
+                            model.e_prompt.prompt[cur_idx] = model.e_prompt.prompt[prev_idx]
+                            # optimizer.param_groups[0]['params'] = model.parameters()
 
-        # # Transfer previous learned prompt param keys to the new prompt
-        # if args.prompt_pool and args.shared_prompt_key:
-        #     if task_id > 0:
-        #         prev_start = (task_id - 1) * args.top_k
-        #         prev_end = task_id * args.top_k
+        # Transfer previous learned prompt param keys to the new prompt
+        if args.prompt_pool and args.shared_prompt_key:
+            if task_id > 0:
+                prev_start = (task_id - 1) * args.top_k
+                prev_end = task_id * args.top_k
 
-        #         cur_start = prev_end
-        #         cur_end = (task_id + 1) * args.top_k
+                cur_start = prev_end
+                cur_end = (task_id + 1) * args.top_k
 
-        #         with torch.no_grad():
-        #             if args.distributed:
-        #                 model.module.e_prompt.prompt_key.grad.zero_()
-        #                 model.module.e_prompt.prompt_key[cur_idx] = model.module.e_prompt.prompt_key[prev_idx]
-        #                 optimizer.param_groups[0]['params'] = model.module.parameters()
-        #             else:
-        #                 model.e_prompt.prompt_key.grad.zero_()
-        #                 model.e_prompt.prompt_key[cur_idx] = model.e_prompt.prompt_key[prev_idx]
-        #                 optimizer.param_groups[0]['params'] = model.parameters()
+                with torch.no_grad():
+                    if args.distributed:
+                        model.module.e_prompt.prompt_key.grad.zero_()
+                        model.module.e_prompt.prompt_key[cur_idx] = model.module.e_prompt.prompt_key[prev_idx]
+                        optimizer.param_groups[0]['params'] = model.module.parameters()
+                    else:
+                        model.e_prompt.prompt_key.grad.zero_()
+                        model.e_prompt.prompt_key[cur_idx] = model.e_prompt.prompt_key[prev_idx]
+                        optimizer.param_groups[0]['params'] = model.parameters()
 
         for epoch in range(args.epochs):
             train_stats = train_one_epoch(model=model, original_model=original_model, criterion=criterion,
@@ -313,8 +312,6 @@ def train_and_evaluate(model: torch.nn.Module, model_without_ddp: torch.nn.Modul
 
             if lr_scheduler:
                 lr_scheduler.step(epoch)
-
-        model.child_prompt_pool = []
 
         if args.prompt_momentum > 0 and task_id > 0:
             if args.use_prefix_tune_for_e_prompt:
@@ -549,5 +546,4 @@ def orth_loss(features, targets, device, args):
         loss = torch.nn.functional.cross_entropy(sim, torch.range(0, sim.shape[0] - 1).long().to(device))
         return args.reg * loss
         # return 0.
-
 

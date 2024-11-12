@@ -1,6 +1,6 @@
 import torch
 import torch.nn as nn
-
+import math
 
 class EPrompt(nn.Module):
     def __init__(self, length=5, embed_dim=768, embedding_key='mean', prompt_init='uniform', prompt_pool=False, 
@@ -8,7 +8,8 @@ class EPrompt(nn.Module):
                  num_layers=1, use_prefix_tune_for_e_prompt=False, num_heads=-1, same_key_value=False,):
         super().__init__()
 
-        self.length = 10
+        self.length = math.ceil(length * 1.5)
+        self.send_length = length
         self.prompt_pool = prompt_pool
         self.embedding_key = embedding_key
         self.prompt_init = prompt_init
@@ -71,7 +72,7 @@ class EPrompt(nn.Module):
         x_inv_norm = torch.rsqrt(torch.maximum(square_sum, torch.tensor(epsilon, device=x.device)))
         return x * x_inv_norm
     
-    def forward(self, x_embed, avg_keys, prompt_mask=None, prompt_idx=None, prompt_weight=None, prompt_momentum=0):
+    def forward(self, x_embed, prompt_list, prompt_mask=None, prompt_idx=None, prompt_weight=None, prompt_momentum=0):
         assert prompt_mask is not None or prompt_idx is not None or prompt_weight is not None
         assert self.prompt_pool, "In HiDe-Prompt, 'prompt_pool' must be set to True"
         out = dict()
@@ -93,65 +94,78 @@ class EPrompt(nn.Module):
                 idx = prompt_mask  # B, top_k
             if idx is not None:
                 out['prompt_idx'] = idx
+            print(prompt_list)
+            if len(prompt_list) == 1:
+                prompt_list = torch.tensor(prompt_list[0])
+            #print(prompt_list)
             if self.use_prefix_tune_for_e_prompt:
                 if prompt_weight is not None:
                     batched_prompt_raw = torch.einsum("bp,ndplhe->ndblhe", prompt_weight, self.prompt) # num_layers, 2, B, top_k, length, C
                     batched_prompt_raw = batched_prompt_raw.unsqueeze(3)
+                    #batched_prompt_raw = batched_prompt_raw[:, :, :, :, prompt_list]
+                    for i in range(self.length):
+                        if (i+1) not in prompt_list:
+                            batched_prompt_raw[:, :, :, :, i] = batched_prompt_raw[:, :, :, :, i].clone().detach()
                     num_layers, dual, batch_size, top_k, length, num_heads, heads_embed_dim = batched_prompt_raw.shape
-                    # print(top_k)
-                    batched_prompt_raw_new = torch.zeros((num_layers, dual, batch_size, top_k, 1, num_heads, heads_embed_dim))
-                    for i in range(batch_size):
-                        batched_prompt_raw_new[:, :, i] = 0.5 * batched_prompt_raw[:, :, i, :, avg_keys[i][0]:avg_keys[i][0]+1] + 0.5 * batched_prompt_raw[:, :, i, :, avg_keys[i][1]:avg_keys[i][1]+1]
-                    length = 1
-                    batched_prompt = batched_prompt_raw_new.reshape(
+                    print("Prompt Length:", length)
+                    batched_prompt = batched_prompt_raw.reshape(
                         num_layers, batch_size, dual, top_k * length, num_heads, heads_embed_dim
                     )
                 elif prompt_momentum > 0 and prompt_mask is not None:
                     with torch.no_grad():
                         batched_prompt_momentum = self.prompt[:, :, 0:idx[0][0]].detach().clone().mean(2, keepdim=True).unsqueeze(2).repeat(1,1,idx.shape[0],1,1,1,1)
                     batched_prompt_raw = (1-prompt_momentum) * self.prompt[:, :, idx] + prompt_momentum * batched_prompt_momentum
+                    #batched_prompt_raw = batched_prompt_raw[:, :, :, :, prompt_list]
+                    for i in range(self.length):
+                        if (i+1) not in prompt_list:
+                            batched_prompt_raw[:, :, :, :, i] = batched_prompt_raw[:, :, :, :, i].clone().detach()
                     num_layers, dual, batch_size, top_k, length, num_heads, heads_embed_dim = batched_prompt_raw.shape
-                    batched_prompt_raw_new = torch.zeros((num_layers, dual, batch_size, top_k, 1, num_heads, heads_embed_dim))
-                    for i in range(batch_size):
-                        batched_prompt_raw_new[:, :, i] = 0.5 * batched_prompt_raw[:, :, i, :, avg_keys[i][0]:avg_keys[i][0]+1] + 0.5 * batched_prompt_raw[:, :, i, :, avg_keys[i][1]:avg_keys[i][1]+1]
-                    length = 1
-                    batched_prompt = batched_prompt_raw_new.reshape(
+                    print("Prompt Length:", length)
+                    batched_prompt = batched_prompt_raw.reshape(
                         num_layers, batch_size, dual, top_k * length, num_heads, heads_embed_dim
                     )
 
                 else:
                     batched_prompt_raw = self.prompt[:, :, idx]  # num_layers, B, top_k, length, C
+                    #print(batched_prompt_raw.shape)
+                    #print(type(prompt_list))
+                    #batched_prompt_raw = batched_prompt_raw[:, :, :, :, prompt_list]
+                    for i in range(self.length):
+                        if (i+1) not in prompt_list:
+                            batched_prompt_raw[:, :, :, :, i] = batched_prompt_raw[:, :, :, :, i].clone().detach()
+                    #print(batched_prompt_raw.shape)
                     num_layers, dual, batch_size, top_k, length, num_heads, heads_embed_dim = batched_prompt_raw.shape
-                    batched_prompt_raw_new = torch.zeros((num_layers, dual, batch_size, top_k, 1, num_heads, heads_embed_dim))
-                    for i in range(batch_size):
-                        batched_prompt_raw_new[:, :, i] = 0.5 * batched_prompt_raw[:, :, i, :, avg_keys[i][0]:avg_keys[i][0]+1] + 0.5 * batched_prompt_raw[:, :, i, :, avg_keys[i][1]:avg_keys[i][1]+1]
-                    length = 1
-                    batched_prompt = batched_prompt_raw_new.reshape(
+                    print("Prompt Length:", length)
+                    batched_prompt = batched_prompt_raw.reshape(
                         num_layers, batch_size, dual, top_k * length, num_heads, heads_embed_dim
                     )
             else:
                 if prompt_weight is not None:
                     batched_prompt_raw = torch.einsum("bp,npld->nbpld", prompt_weight, self.prompt)
+                    #batched_prompt_raw = batched_prompt_raw[:, :, :, prompt_list]
+                    for i in range(self.length):
+                        if (i+1) not in prompt_list:
+                            batched_prompt_raw[:, :, :, i] = batched_prompt_raw[:, :, :, i].clone().detach()
                     num_layers, batch_size, top_k, length, embed_dim = batched_prompt_raw.shape
-                    batched_prompt_raw_new = torch.zeros((num_layers, batch_size, top_k, 1, embed_dim))
-                    for i in range(batch_size):
-                        batched_prompt_raw_new[:, i] = 0.5 * batched_prompt_raw[:, i, :, avg_keys[i][0]:avg_keys[i][0]+1] + 0.5 * batched_prompt_raw[:, i, :, avg_keys[i][1]:avg_keys[i][1]+1]
-                    length = 1
-                    batched_prompt = batched_prompt_raw_new.reshape(
+                    print("Prompt Length:", length)
+                    batched_prompt = batched_prompt_raw.reshape(
                         num_layers, batch_size, top_k * length, embed_dim
                     )
                 else:
                     batched_prompt_raw = self.prompt[:, idx]
+                    #batched_prompt_raw = batched_prompt_raw[:, :, :, prompt_list]
+                    for i in range(self.length):
+                        if (i+1) not in prompt_list:
+                            batched_prompt_raw[:, :, :, i] = batched_prompt_raw[:, :, :, i].clone().detach()
                     num_layers, batch_size, top_k, length, embed_dim = batched_prompt_raw.shape
-                    batched_prompt_raw_new = torch.zeros((num_layers, batch_size, top_k, 1, embed_dim))
-                    for i in range(batch_size):
-                        batched_prompt_raw_new[:, i] = 0.5 * batched_prompt_raw[:, i, :, avg_keys[i][0]:avg_keys[i][0]+1] + 0.5 * batched_prompt_raw[:, i, :, avg_keys[i][1]:avg_keys[i][1]+1]
-                    length = 1
-                    batched_prompt = batched_prompt_raw_new.reshape(
+                    print("Prompt Length:", length)
+                    batched_prompt = batched_prompt_raw.reshape(
                         num_layers, batch_size, top_k * length, embed_dim
                     )
         
         out['batched_prompt'] = batched_prompt
 
         return out
+    
+    
 
